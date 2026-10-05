@@ -155,7 +155,21 @@ REQUEST_TIMEOUT = 1800.0   # seconds; video pose is minutes, not seconds
 # Promptable segmentation. The prompt is the whole route definition — change
 # the colour and the demo follows a different route up the same wall.
 HOLD_MODEL = "facebook/sam3.1"
-HOLD_COLOR = "green"                        # the route being climbed
+
+# Where SAM runs: the route, the floor and the missed-hold recovery alike.
+# "gateway" sends them to the VLM Run Gateway. "local" runs SAM on this
+# machine's GPU (src/local_sam.py) and needs `pip install torch torchvision
+# transformers`, plus access to the gated checkpoint on Hugging Face. Results
+# are cached separately. With POSE_BACKEND also "local", no API key is needed.
+SAM_BACKEND = "local"
+
+# Local only. SAM 3 rather than the gateway's 3.1, which Transformers cannot
+# load. Tracking 128 sampled frames peaks near 6 GB of video memory in half
+# precision; lower HOLD_TRACK_MAX_FRAMES if a smaller card runs out.
+SAM_LOCAL_MODEL = "facebook/sam3"
+SAM_LOCAL_HALF = True             # float16 on the GPU
+SAM_LOCAL_THRESHOLD = 0.3         # stills: instances below this score are not returned
+HOLD_COLOR = "yellow"                        # the route being climbed
 
 # Per-clip override, keyed on the file's stem. A batch is normally one route
 # filmed several times, so one colour serves — but a folder of unrelated clips
@@ -206,6 +220,19 @@ HOLD_MIN_SIGHTINGS = 8        # a track seen fewer times than this is not a hold
 # count: handheld, a hold off-screen for half the clip would otherwise look like
 # a hold the model kept losing.
 HOLD_MIN_APPEARANCE = 0.30
+
+# A second opinion from stills, for holds the tracker missed. The tracker
+# commits to what it finds at the start of a segment, so a hold it does not pick
+# up early stays missed, or turns up too late to count. This many evenly spaced
+# stills are segmented with the same prompt, each from scratch, and a hold that
+# enough of them agree on — same place on the canvas — joins the route if the
+# tracker has nothing there. 0 turns the pass off. On the gateway it is one
+# extra call per still.
+HOLD_STILL_FRAMES = 12
+HOLD_STILL_MIN_SUPPORT = 4        # stills that must agree before it is a hold
+HOLD_STILL_MIN_APPEARANCE = 0.5   # …and their share of the stills that had it in shot
+HOLD_STILL_MATCH_IOU = 0.3        # canvas overlap for two stills' instances to be one hold
+HOLD_STILL_MAX_OVERLAP = 0.1      # above this against a tracked hold, the tracker has it
 
 # SAM sometimes drops a track and picks the same hold back up under a new id.
 # On the canvas those are two outlines in the same place — a question only the
@@ -279,6 +306,22 @@ FLOOR_LINE_THICK = 2
 # ── The climber: ViTPose ─────────────────────────────────────────────────────
 POSE_MODEL = "usyd-community/vitpose-plus-large"
 
+# Where ViTPose runs. "gateway" sends the clip to the VLM Run Gateway. "local"
+# runs the same checkpoint on this machine's GPU (src/local_pose.py) and needs
+# `pip install torch torchvision transformers`; the weights download from
+# Hugging Face on the first run. The result is cached either way, separately.
+POSE_BACKEND = "local"
+
+# Local only. ViTPose is handed boxes rather than finding people itself, so a
+# detector runs in front of it, and a box tracker supplies the `track_id`s.
+POSE_LOCAL_DETECTOR = "PekingU/rtdetr_r50vd_coco_o365"
+POSE_LOCAL_DET_THRESHOLD = 0.3    # person boxes below this score are ignored
+POSE_LOCAL_MAX_NESTED = 0.8       # a box this far inside a surer one is the same body
+POSE_LOCAL_BATCH = 8              # frames per forward pass; lower it if VRAM runs out
+POSE_LOCAL_HALF = True            # float16 on the GPU: half the memory, same joints
+POSE_LOCAL_TRACK_MIN_IOU = 0.2    # overlap needed to carry a track_id to the next frame
+POSE_LOCAL_TRACK_MAX_GAP = 1.0    # seconds unseen before a track is retired
+
 # Pose runs on every decoded frame either way; video_fps is the *detector*
 # cadence and reaches stride 1 once it is >= the decoded rate. A hand arriving
 # on a hold is a few frames, so nothing here decimates.
@@ -324,6 +367,21 @@ START_DWELL_SECONDS = 0.4
 # ankle into the mat costs a frame, not the whole run — otherwise the clock
 # needs START_DWELL_SECONDS of flawless pose, which on a low start it never gets.
 START_DWELL_DECAY = 1
+
+# How the route ends. "hold": both wrists on the highest hold. "edge": both
+# wrists on the top edge of the wall, for problems that finish over the lip.
+# "either": whichever happens first. The edge is found by segmenting the wall
+# itself and reading off its upper boundary, the floor line turned upside down.
+FINISH_RULE = "either"
+WALL_TOP_PROMPT = "climbing wall"
+WALL_TOP_SAMPLE_FRAMES = 8     # stills the edge is read off, like the floor's
+WALL_TOP_MIN_SCORE = 0.50
+WALL_TOP_MIN_AREA = 0.15       # the wall fills the shot; anything smaller is a panel
+# A hand gripping the lip puts the wrist just under it. Body heights: a wrist
+# this far below the edge, or anywhere above it, is on it. Keep it well under
+# the gap between the lip and the highest hold, or reaching that hold finishes.
+WALL_TOP_REACH = 0.06
+WALL_TOP_DWELL_SECONDS = 0.5   # both wrists there for this long: the route is done
 
 HOLD_DWELL_SECONDS = 0.5
 FINAL_HOLD_DWELL_SECONDS = 0.5    # both wrists on the top hold: the route is done
@@ -677,7 +735,7 @@ TIMER = True
 TIMER_SIZE = 26
 TIMER_COLOR = (255, 255, 255)
 
-CREDIT_TEXT = "Jeremy Park"           # drawn under the clock; None omits it
+CREDIT_TEXT = "Dmitrii Sidorenko"     # drawn under the clock; None omits it
 CREDIT_SIZE = 21
 CREDIT_COLOR = (180, 180, 180)
 
