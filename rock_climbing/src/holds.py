@@ -604,6 +604,139 @@ def shape(clusters: list[Cluster], camera: Track, sampled: list[int], *,
     return holds
 
 
+# ── holds the tracker missed: a second opinion from stills ───────────────────
+# The tracker commits early. It initialises on what it finds in a segment's
+# first frames and carries those identities forward, so a hold it does not pick
+# up at the start tends to stay missed — or to turn up for the last two seconds,
+# seven sightings short of counting. A still has no such history: each one is
+# asked the same question from scratch.
+#
+# And the same fact that checks the tracker checks the stills. A hold is bolted
+# to the wall, so a real one lands on the same canvas pixels in every still that
+# can see it, while a false alarm — a shoe, a chalk bag, a patch of light — has
+# no reason to. Agreement across stills, on the canvas, is the test.
+
+def still_clusters(per_frame: list[FrameMasks], indices: list[int], camera: Track, *,
+                   min_score: float, match_iou: float, min_support: int,
+                   min_appearance: float) -> list[Cluster]:
+    """Holds that independent stills agree on, as clusters on the canvas.
+
+    Instances are grouped by where they land: one joins the group whose median
+    box it overlaps most, if that is at least ``match_iou``, and otherwise
+    starts its own. A group is a hold when at least ``min_support`` stills found
+    it, and they are at least ``min_appearance`` of the stills that had it in
+    shot. A cluster's `tracks` is empty: no tracker vouched for it.
+    """
+    groups: list[dict] = []
+    for index, result in zip(indices, per_frame):
+        if index >= camera.n_frames:
+            continue
+        labels = _decode_label_map(result.mask)
+        taken: set[int] = set()         # one instance per group per still
+        for item in sorted(result.items, key=lambda i: -float(i.get("score") or 0.0)):
+            score = float(item.get("score") or 0.0)
+            box = item.get("bbox_xywh")
+            if score < min_score or not box:
+                continue
+            polygon = np.zeros((0, 2))
+            blob = instance_mask(labels, item)
+            if blob is not None:
+                contour = _contour(blob)
+                if len(contour) >= 3:
+                    polygon = contour / [blob.shape[1], blob.shape[0]]
+            if len(polygon) < 3:
+                x, y, w, h = box
+                polygon = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+            canvas = camera.to_canvas(polygon, int(index))
+            bbox = _bbox(canvas)
+
+            best, best_iou = -1, match_iou
+            for position, group in enumerate(groups):
+                if position in taken:
+                    continue
+                overlap = _iou(bbox, group["bbox"])
+                if overlap >= best_iou:
+                    best, best_iou = position, overlap
+            if best < 0:
+                groups.append({"boxes": [], "polygons": [], "frames": [], "scores": []})
+                best = len(groups) - 1
+            group = groups[best]
+            taken.add(best)
+            group["boxes"].append(bbox)
+            group["polygons"].append(canvas)
+            group["frames"].append(int(index))
+            group["scores"].append(score)
+            group["bbox"] = [float(v) for v in np.median(group["boxes"], axis=0)]
+
+    clusters: list[Cluster] = []
+    for group in groups:
+        if len(group["frames"]) < max(min_support, 1):
+            continue
+        cluster = Cluster(tracks=[], polygons=group["polygons"],
+                          frames=group["frames"], scores=group["scores"])
+        could_see = visible_frames(cluster.centre, camera, indices)
+        if len(cluster.frames) / max(len(could_see), 1) < min_appearance:
+            continue
+        clusters.append(cluster)
+    return clusters
+
+
+def missed(stills: list[Cluster], tracked: list[Cluster], *, max_overlap: float
+           ) -> list[Cluster]:
+    """The still clusters that are not a hold the tracker already has.
+
+    The tracker's holds are left alone: where both saw a hold, the tracked
+    outline has a hundred sightings behind it and the stills a dozen. A still
+    cluster counts as already-had when it overlaps a tracked one at all
+    seriously, or when either one's centre sits inside the other's box.
+    """
+    def inside(point, box) -> bool:
+        return box[0] <= point[0] <= box[0] + box[2] and box[1] <= point[1] <= box[1] + box[3]
+
+    out = []
+    for cluster in stills:
+        box, centre = cluster.bbox, cluster.centre
+        if any(_iou(box, kept.bbox) > max_overlap or inside(centre, kept.bbox)
+               or inside(kept.centre, box) for kept in tracked):
+            continue
+        out.append(cluster)
+    return out
+
+
+def stills_cache_path(video: Path, cache_dir: Path, *, model: str, prompt: str,
+                      n_frames: int) -> Path:
+    stat = video.stat()
+    key = json.dumps({
+        "video": video.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+        "model": model, "prompt": prompt, "n_frames": n_frames, "contract": "stills-v1",
+    }, sort_keys=True)
+    return cache_dir / f"hold_stills.{hashlib.sha256(key.encode()).hexdigest()[:12]}.json"
+
+
+def save_stills_cache(path: Path, indices: list[int], per_frame: list[FrameMasks],
+                      usages: list, *, stamp: str) -> None:
+    """The raw per-still replies, so the agreement rules stay free to re-tune."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "created": stamp, "usages": usages,
+        "frames": [{"index": int(i), "items": f.items, "mask": f.mask}
+                   for i, f in zip(indices, per_frame)]}))
+
+
+def load_stills_cache(path: Path):
+    """``(indices, per_frame, usages, created)``, or None."""
+    if not path.is_file():
+        return None
+    try:
+        blob = json.loads(path.read_text())
+        frames = blob["frames"]
+        return ([int(f["index"]) for f in frames],
+                [FrameMasks(items=f["items"], mask=f["mask"]) for f in frames],
+                blob.get("usages") or [], blob.get("created", "unknown"))
+    except (json.JSONDecodeError, AttributeError, KeyError, TypeError, OSError):
+        return None
+
+
 # ── geometry shared with the tripod version ──────────────────────────────────
 
 def _iou(a, b) -> float:

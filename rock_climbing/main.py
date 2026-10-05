@@ -501,6 +501,52 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                             vote_fraction=cfg.HOLD_VOTE_FRACTION,
                             min_area_px=cfg.HOLD_MIN_AREA_PX,
                             fill_holes=cfg.HOLD_FILL_HOLES)
+
+    # A second opinion from stills: holds the tracker never locked onto. See
+    # `holds.still_clusters`.
+    still_cost = 0.0
+    n_from_stills = 0
+    if cfg.HOLD_STILL_FRAMES:
+        stills_cache = holds_mod.stills_cache_path(
+            mp4, cfg.CACHE_DIR, model=sam_model, prompt=prompt,
+            n_frames=cfg.HOLD_STILL_FRAMES)
+        cached_stills = holds_mod.load_stills_cache(stills_cache) if cfg.REUSE_HOLDS else None
+        if cached_stills is not None:
+            still_indices, still_frames, still_usages, created = cached_stills
+            console.print(f"  stills: [green]cache hit[/] from [dim]{created}[/]")
+        else:
+            client = sam_local if local_sam_on else OpenAI(
+                base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
+                timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
+            stills = holds_mod.sample_frames(mp4, cfg.HOLD_STILL_FRAMES)
+            still_indices = [i for i, _ in stills]
+            with console.status(f"[cyan]{SAM_NAME}[/] is looking at "
+                                f"{len(stills)} stills for missed holds…", spinner="dots"):
+                still_frames, still_usages = holds_mod.segment_frames(
+                    client, stills, model=sam_model, prompt=prompt, min_score=0.0,
+                    workers=cfg.FLOOR_REQUEST_WORKERS)
+            holds_mod.save_stills_cache(
+                stills_cache, still_indices, still_frames, still_usages,
+                stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        still_cost = sum((u or {}).get("cost") or 0.0 for u in still_usages)
+        agreed = holds_mod.still_clusters(
+            still_frames, still_indices, track, min_score=cfg.HOLD_MIN_SCORE,
+            match_iou=cfg.HOLD_STILL_MATCH_IOU, min_support=cfg.HOLD_STILL_MIN_SUPPORT,
+            min_appearance=cfg.HOLD_STILL_MIN_APPEARANCE)
+        extra = holds_mod.shape(
+            holds_mod.missed(agreed, clusters, max_overlap=cfg.HOLD_STILL_MAX_OVERLAP),
+            track, still_indices, raster_size=cfg.HOLD_RASTER_SIZE,
+            vote_fraction=cfg.HOLD_VOTE_FRACTION, min_area_px=cfg.HOLD_MIN_AREA_PX,
+            fill_holes=cfg.HOLD_FILL_HOLES)
+        for hold in extra:
+            hold["from_stills"] = True
+            console.print(f"  [green]added a hold[/] at "
+                          f"{tuple(round(v, 3) for v in hold['bbox'])} "
+                          f"(score {hold['score']:.2f}) — [dim]the tracker missed it, "
+                          f"but {hold['appearances']} of {len(still_indices)} stills "
+                          f"found it in the same place[/]")
+        n_from_stills = len(extra)
+        route = route + extra
     n_voted = len(route)
     route, swallowed = holds_mod.suppress_contained(
         route, max_containment=cfg.HOLD_NMS_CONTAINMENT)
@@ -511,11 +557,14 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                       f"inside a larger hold scoring {big['score']:.2f}; "
                       f"HOLD_NMS_CONTAINMENT = {cfg.HOLD_NMS_CONTAINMENT}[/]")
 
-    hold_cost = float((hold_usage or {}).get("cost") or 0.0)
+    hold_cost = float((hold_usage or {}).get("cost") or 0.0) + still_cost
     drifts = [h["drift_px"] for h in route]
     kv({
         "tracks returned": f"{n_tracks} over {len(sampled)} sampled frames "
                            f"({len(sightings)} sightings)",
+        "found in stills": (f"{n_from_stills} the tracker missed, agreed on by "
+                            f"{cfg.HOLD_STILL_MIN_SUPPORT}+ of {cfg.HOLD_STILL_FRAMES} stills"
+                            if cfg.HOLD_STILL_FRAMES else "off"),
         "holds on the canvas": f"[bold]{len(route)}[/]"
                                + (f" ({n_voted - len(route)} swallowed by a "
                                   f"larger hold)" if swallowed else ""),
@@ -573,6 +622,46 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
         else:
             console.print(f"  [yellow]no floor found[/] for {cfg.FLOOR_PROMPT!r}; "
                           "the start rule falls back to both feet on holds")
+
+    # ── 6c. The top of the wall ──────────────────────────────────────────────
+    # For problems that finish over the lip rather than on a hold. The floor
+    # line turned upside down: segment the wall, read off its upper boundary.
+    wall_top = None
+    if cfg.FINISH_RULE in ("edge", "either"):
+        top_settings = {"sample_frames": cfg.WALL_TOP_SAMPLE_FRAMES,
+                        "min_score": cfg.WALL_TOP_MIN_SCORE,
+                        "min_area": cfg.WALL_TOP_MIN_AREA,
+                        "resolution": cfg.FLOOR_EDGE_RESOLUTION,
+                        "canvas": camera_settings, "edge": "wall-top"}
+        top_cache = floor_mod.cache_path(mp4, cfg.CACHE_DIR, model=sam_model,
+                                         prompt=cfg.WALL_TOP_PROMPT, settings=top_settings)
+        cached_top = floor_mod.load_cache(top_cache) if cfg.REUSE_FLOOR else None
+        if cached_top is not None:
+            wall_top, top_usages, created = cached_top
+            console.print(f"  wall top: [green]cache hit[/] from [dim]{created}[/]")
+        else:
+            client = sam_local if local_sam_on else OpenAI(
+                base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
+                timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
+            stills = holds_mod.sample_frames(mp4, cfg.WALL_TOP_SAMPLE_FRAMES)
+            per_frame, top_usages = floor_mod.segment(
+                client, stills, model=sam_model, prompt=cfg.WALL_TOP_PROMPT,
+                resolution=cfg.FLOOR_EDGE_RESOLUTION, min_score=cfg.WALL_TOP_MIN_SCORE,
+                min_area=cfg.WALL_TOP_MIN_AREA, workers=cfg.FLOOR_REQUEST_WORKERS)
+            wall_top = floor_mod.consensus_canvas(
+                per_frame, [i for i, _ in stills], track,
+                resolution=cfg.FLOOR_EDGE_RESOLUTION, min_score=cfg.WALL_TOP_MIN_SCORE,
+                min_area=cfg.WALL_TOP_MIN_AREA, min_support=cfg.FLOOR_MIN_SUPPORT)
+            floor_mod.save_cache(top_cache, wall_top, top_usages,
+                                 stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        floor_cost += sum((u or {}).get("cost") or 0.0 for u in top_usages)
+        if wall_top is not None:
+            lo, hi = float(np.nanmin(wall_top.edge)), float(np.nanmax(wall_top.edge))
+            console.print(f"  wall's top edge at canvas y [bold]{lo:.3f}-{hi:.3f}[/] "
+                          f"([dim]{cfg.WALL_TOP_PROMPT!r}[/])")
+        else:
+            console.print(f"  [yellow]no wall found[/] for {cfg.WALL_TOP_PROMPT!r}; "
+                          "the route can only finish on the top hold")
 
     if local_sam_on:
         local_sam.unload()    # the pose models want the GPU next
@@ -731,7 +820,7 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     # framing at that moment.
     aspect = track.size[0] / track.size[1]
     analysis = climb.analyze(route, poses, fps=info.fps, aspect=aspect, cfg=cfg,
-                             floor=ground)
+                             floor=ground, wall_top=wall_top)
     # ── 8b. Holds the prompt missed ──────────────────────────────────────────
     # Run against the finished climb rather than before it, for two reasons: the
     # window between pulling on and topping out is the only stretch where a
@@ -782,7 +871,7 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
         console.print(f"  [bold]re-reading the climb[/] against "
                       f"{len(route)} holds")
         analysis = climb.analyze(route, poses, fps=info.fps, aspect=aspect,
-                                 cfg=cfg, floor=ground)
+                                 cfg=cfg, floor=ground, wall_top=wall_top)
         frames = poses.frames()
 
     if cfg.ROUTE_FRAME_ON_HOLDS:
@@ -818,7 +907,9 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                            f"({analysis.start_frame / info.fps:.2f}s)"
                   if analysis.start_frame is not None else "[yellow]not detected[/]")
     table.add_row("topped out", f"frame {analysis.completion_frame} "
-                                f"(hold {analysis.final_hold_id})"
+                                + ("(top edge of the wall)"
+                                   if analysis.finished_on == "edge"
+                                   else f"(hold {analysis.final_hold_id})")
                   if analysis.completion_frame is not None else "[yellow]no[/]")
     if analysis.elapsed is not None:
         table.add_row("time on the wall", f"[bold green]{analysis.elapsed:.2f}s[/]")
@@ -856,8 +947,10 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                       "HOLD_DWELL_SECONDS or raise ANKLE_TO_TOE_OFFSET.")
     if analysis.completion_frame is None:
         console.print("  [yellow]warning[/] no top-out: both wrists never dwelt on hold "
-                      f"{analysis.final_hold_id} together. Lower "
-                      "FINAL_HOLD_DWELL_SECONDS, or check that the top hold was found.")
+                      f"{analysis.final_hold_id} together"
+                      + (", nor on the wall's top edge" if wall_top is not None else "")
+                      + ". Lower FINAL_HOLD_DWELL_SECONDS, check that the top hold "
+                      "was found, or see FINISH_RULE.")
 
     return Run(
         video=source, label=label, run_dir=run_dir, src_info=src_info, mp4=mp4,

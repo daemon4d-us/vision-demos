@@ -88,6 +88,7 @@ class ClimbAnalysis:
     holds: list[dict] = field(default_factory=list)
     window: tuple[int, int] | None = None   # the climb; set by restrict()
     start_rule: str = "holds"               # "floor" when a floor was available
+    finished_on: str | None = None          # "hold" or "edge": which rule ended it
 
     @property
     def elapsed(self) -> float | None:
@@ -109,6 +110,7 @@ class ClimbAnalysis:
             "final_hold_id": self.final_hold_id,
             "elapsed_seconds": round(self.elapsed, 3) if self.elapsed is not None else None,
             "topped_out": self.completion_frame is not None,
+            "finished_on": self.finished_on,
             "start_rule": self.start_rule,
             "order": [hid for hid, _ in sorted(self.order.items(), key=lambda kv: kv[1])],
         }
@@ -219,7 +221,7 @@ def scales(holds: list[dict], poses) -> tuple[float, float]:
 
 
 def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
-            floor=None) -> ClimbAnalysis:
+            floor=None, wall_top=None) -> ClimbAnalysis:
     """Walk the clip once, in order, and record what each limb held."""
     frames = poses.frames()
     if not holds or not frames:
@@ -274,6 +276,14 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
 
     final_dwell = 0
     completion_frame = None
+    finished_on = None
+    # Some problems finish on the top of the wall rather than on a hold: the
+    # last move is both hands over the lip. FINISH_RULE says which this is.
+    hold_finishes = cfg.FINISH_RULE in ("hold", "either") or wall_top is None
+    edge_finishes = cfg.FINISH_RULE in ("edge", "either") and wall_top is not None
+    edge_reach = cfg.WALL_TOP_REACH * body_unit
+    edge_frames = max(1, int(round(cfg.WALL_TOP_DWELL_SECONDS * fps)))
+    edge_dwell = 0
     start_dwell = 0
     start_frame = None
 
@@ -354,7 +364,30 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
 
         holding[frame] = now
 
-        if completion_frame is None:
+        if completion_frame is None and edge_finishes and start_frame is not None:
+            # Topping out on the lip: both wrists at the wall's top edge, or
+            # over it, held. Measured against the edge directly rather than
+            # through the contact tracker, because the lip is not a hold — it
+            # has no outline to be inside, only a line to have reached.
+            #
+            # Only once the clock is running. The edge is a line in the image,
+            # and somebody walking up to the wall close to the lens has their
+            # hands above it without being anywhere near it.
+            on_edge = True
+            for limb in LIMBS:
+                if limb.key not in WRIST_KEYS:
+                    continue
+                point = limb_point(poses, frame, limb, cfg=cfg)
+                top = wall_top.at(float(point[0])) if point is not None else None
+                if top is None or point[1] > top + edge_reach:
+                    on_edge = False
+                    break
+            edge_dwell = edge_dwell + 1 if on_edge else 0
+            if edge_dwell >= edge_frames:
+                completion_frame = frame
+                finished_on = "edge"
+
+        if completion_frame is None and hold_finishes:
             # Topping out: both wrists in *confirmed contact* with the final
             # hold at once — the same state that lights the hold on the panel,
             # not a second opinion about it.
@@ -389,6 +422,7 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
                 final_dwell = max(final_dwell + 1, overlap)
                 if final_dwell >= final_frames:
                     completion_frame = frame
+                    finished_on = "hold"
             else:
                 final_dwell = max(0, final_dwell - cfg.FINAL_DWELL_DECAY)
 
@@ -461,7 +495,8 @@ def analyze(holds: list[dict], poses, *, fps: float, aspect: float, cfg,
         activated_at=activated_at, order=order, midline=midline, contacts=contacts,
         holding=holding, start_frame=start_frame, completion_frame=completion_frame,
         final_hold_id=final_hold["id"], fps=fps, holds=holds,
-        start_rule="floor" if floor is not None else "holds")
+        start_rule="floor" if floor is not None else "holds",
+        finished_on=finished_on)
 
 
 def renumber(analysis: ClimbAnalysis, mapping: dict[int, int]) -> None:
@@ -886,7 +921,10 @@ def summary_text(analysis: ClimbAnalysis, rows: list[dict], util: Utilization, *
     else:
         lines.append(f"{'time on the wall':<28}start never detected")
     lines += [
-        f"{'topped out':<28}{'yes' if analysis.completion_frame is not None else 'no'}",
+        f"{'topped out':<28}" + ("no" if analysis.completion_frame is None else
+                                  "yes, both hands on the top edge of the wall"
+                                  if analysis.finished_on == "edge"
+                                  else "yes, both hands on the top hold"),
         f"{'start rule':<28}" + ("both feet clear of the floor, one hand on a hold"
                                    if analysis.start_rule == "floor"
                                    else "both feet on holds (no floor found)"),

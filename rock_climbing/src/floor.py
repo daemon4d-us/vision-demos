@@ -43,6 +43,18 @@ class Floor:
         value = float(self.edge[i])
         return value if np.isfinite(value) else 1.0
 
+    def at(self, x: float) -> float | None:
+        """The edge's height at normalized x, or None where nothing saw it.
+
+        `top_at` answers "unknown" with the bottom of the frame, which is right
+        for a floor — nothing is ever below it — and wrong for anything read the
+        other way up, so the wall's top edge asks here instead.
+        """
+        if not len(self.edge) or not 0.0 <= x <= 1.0:
+            return None
+        value = float(self.edge[int(round(x * (len(self.edge) - 1)))])
+        return value if np.isfinite(value) else None
+
     def is_clear(self, x: float, y: float, clearance: float,
                  frame: int | None = None) -> bool:
         """True when the point sits above the floor by at least *clearance*.

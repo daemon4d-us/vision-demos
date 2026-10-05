@@ -221,6 +221,19 @@ HOLD_MIN_SIGHTINGS = 8        # a track seen fewer times than this is not a hold
 # a hold the model kept losing.
 HOLD_MIN_APPEARANCE = 0.30
 
+# A second opinion from stills, for holds the tracker missed. The tracker
+# commits to what it finds at the start of a segment, so a hold it does not pick
+# up early stays missed, or turns up too late to count. This many evenly spaced
+# stills are segmented with the same prompt, each from scratch, and a hold that
+# enough of them agree on — same place on the canvas — joins the route if the
+# tracker has nothing there. 0 turns the pass off. On the gateway it is one
+# extra call per still.
+HOLD_STILL_FRAMES = 12
+HOLD_STILL_MIN_SUPPORT = 4        # stills that must agree before it is a hold
+HOLD_STILL_MIN_APPEARANCE = 0.5   # …and their share of the stills that had it in shot
+HOLD_STILL_MATCH_IOU = 0.3        # canvas overlap for two stills' instances to be one hold
+HOLD_STILL_MAX_OVERLAP = 0.1      # above this against a tracked hold, the tracker has it
+
 # SAM sometimes drops a track and picks the same hold back up under a new id.
 # On the canvas those are two outlines in the same place — a question only the
 # canvas can answer, since in the video they never coexist.
@@ -354,6 +367,21 @@ START_DWELL_SECONDS = 0.4
 # ankle into the mat costs a frame, not the whole run — otherwise the clock
 # needs START_DWELL_SECONDS of flawless pose, which on a low start it never gets.
 START_DWELL_DECAY = 1
+
+# How the route ends. "hold": both wrists on the highest hold. "edge": both
+# wrists on the top edge of the wall, for problems that finish over the lip.
+# "either": whichever happens first. The edge is found by segmenting the wall
+# itself and reading off its upper boundary, the floor line turned upside down.
+FINISH_RULE = "either"
+WALL_TOP_PROMPT = "climbing wall"
+WALL_TOP_SAMPLE_FRAMES = 8     # stills the edge is read off, like the floor's
+WALL_TOP_MIN_SCORE = 0.50
+WALL_TOP_MIN_AREA = 0.15       # the wall fills the shot; anything smaller is a panel
+# A hand gripping the lip puts the wrist just under it. Body heights: a wrist
+# this far below the edge, or anywhere above it, is on it. Keep it well under
+# the gap between the lip and the highest hold, or reaching that hold finishes.
+WALL_TOP_REACH = 0.06
+WALL_TOP_DWELL_SECONDS = 0.5   # both wrists there for this long: the route is done
 
 HOLD_DWELL_SECONDS = 0.5
 FINAL_HOLD_DWELL_SECONDS = 0.5    # both wrists on the top hold: the route is done
