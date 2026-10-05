@@ -735,7 +735,7 @@ TIMER = True
 TIMER_SIZE = 26
 TIMER_COLOR = (255, 255, 255)
 
-CREDIT_TEXT = "Jeremy Park"           # drawn under the clock; None omits it
+CREDIT_TEXT = "Dmitrii Sidorenko"     # drawn under the clock; None omits it
 CREDIT_SIZE = 21
 CREDIT_COLOR = (180, 180, 180)
 
