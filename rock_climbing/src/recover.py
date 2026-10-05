@@ -48,7 +48,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from src import holds as holds_mod
+from src import holds as holds_mod, local_sam
 from src.camera import Track
 
 
@@ -194,6 +194,9 @@ def _frame_image(video, index: int) -> np.ndarray | None:
 def _segment_box(client, image: np.ndarray, box, *, model: str
                  ) -> tuple[list[dict], dict | None, dict | None]:
     """SAM 3.1 `segment_box`: what object is inside this box. No colour involved."""
+    if isinstance(client, local_sam.Local):
+        content = client.segment_box(image, box)["content"]
+        return content["items"], content["mask"], {"backend": "local", "cost": 0.0}
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": [{

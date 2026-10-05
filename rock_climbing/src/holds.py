@@ -70,6 +70,7 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
+from src import local_sam
 from src.camera import Track
 
 CONTENT_OBJECT = "vid.segment.masks"
@@ -298,6 +299,12 @@ def segment_frames(client, frames, *, model: str, prompt: str, min_score: float,
 
     def one(entry):
         index, frame = entry
+        if isinstance(client, local_sam.Local):
+            content = client.segment(frame, prompt)["content"]
+            return index, FrameMasks(
+                items=[i for i in content["items"]
+                       if float(i.get("score") or 0.0) >= min_score],
+                mask=content["mask"]), {"backend": "local", "cost": 0.0}
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": [{
@@ -318,6 +325,9 @@ def segment_frames(client, frames, *, model: str, prompt: str, min_score: float,
             mask=content.get("mask"))
         return index, result, (response.usage.model_dump() if response.usage else None)
 
+    # One GPU, one model: local stills go through in turn.
+    if isinstance(client, local_sam.Local):
+        workers = 1
     results: list[tuple[int, FrameMasks, dict | None]] = []
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         for index, result, usage in pool.map(one, frames):

@@ -5,6 +5,8 @@ read the route off the pair.
     python main.py
 
 Both models run on the VLM Run Gateway, so there are no weights to download.
+Either can instead run on this machine's GPU: see ``SAM_BACKEND`` and
+``POSE_BACKEND`` in config.py. With both local, no API key is needed.
 
 With ``BATCH_MODE`` on, every clip in ``INPUT_DIR`` is read as another attempt at
 the same route and each render ends on a panel comparing its sequence of holds
@@ -36,6 +38,9 @@ from src import (camera as camera_mod, climb, compare, floor as floor_mod,
 from src.env import load_api_key
 
 console = Console()
+
+# What the console calls SAM: the gateway serves 3.1, the local backend runs 3.
+SAM_NAME = "SAM 3" if cfg.SAM_BACKEND == "local" else "SAM 3.1"
 
 
 def rule(step: int, title: str) -> None:
@@ -349,9 +354,18 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     fit = mosaic.Fit(track.size, (export_info.width, export_info.height))
 
     # ── 6. The route ─────────────────────────────────────────────────────────
-    rule(6, "The route (SAM 3.1, tracked)")
+    rule(6, f"The route ({SAM_NAME}, tracked)")
     colour = hold_color(label)
     prompt = cfg.HOLD_PROMPT.format(color=colour)
+    # The local checkpoint's name stands in for the gateway's everywhere the
+    # model is named, the cache keys included, so the two never share a cache.
+    local_sam_on = cfg.SAM_BACKEND == "local"
+    sam_model = cfg.SAM_LOCAL_MODEL if local_sam_on else cfg.HOLD_MODEL
+    if local_sam_on:
+        from src import local_sam
+        sam_local = local_sam.Local(checkpoint=cfg.SAM_LOCAL_MODEL,
+                                    half=cfg.SAM_LOCAL_HALF,
+                                    threshold=cfg.SAM_LOCAL_THRESHOLD)
     # One `track` call keeps at most 128 samples and initialises once, so a long
     # clip is cut into segments rather than having its stride coarsened. See
     # `holds.segment_plan` — on a clip where the camera walks all the way round,
@@ -362,12 +376,13 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     hold_settings = {"stride": cfg.HOLD_TRACK_STRIDE,
                      "max_frames": cfg.HOLD_TRACK_MAX_FRAMES,
                      "min_score": cfg.HOLD_MIN_SCORE, "segments": len(plan)}
-    holds_cache = holds_mod.cache_path(mp4, cfg.CACHE_DIR, model=cfg.HOLD_MODEL,
+    holds_cache = holds_mod.cache_path(mp4, cfg.CACHE_DIR, model=sam_model,
                                        prompt=prompt, settings=hold_settings)
     cached_holds = holds_mod.load_cache(holds_cache) if cfg.REUSE_HOLDS else None
 
     n_samples = sum(-(-length // cfg.HOLD_TRACK_STRIDE) for _, length in plan)
-    kv({"model": cfg.HOLD_MODEL,
+    kv({"model": sam_model,
+        "backend": cfg.SAM_BACKEND,
         "method": f"track [dim]({len(plan)} call{'s' if len(plan) > 1 else ''}, "
                   f"{'segmented' if len(plan) > 1 else 'whole clip'})[/]",
         "prompt": f"[bold]{prompt}[/]",
@@ -380,8 +395,40 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     if cached_holds is not None:
         payload, hold_usage, created = cached_holds
         console.print(f"  [green]cache hit[/]: tracks from [dim]{created}[/] "
-                      f"([dim]{holds_cache.name}[/]); no gateway call")
+                      f"([dim]{holds_cache.name}[/]); SAM not run")
         console.print("  [dim]set REUSE_HOLDS = False in config.py to re-track[/]")
+    elif local_sam_on:
+        if cfg.REUSE_HOLDS:
+            console.print("  [yellow]no cached tracks for these settings[/], "
+                          "tracking locally")
+        parts, peaks = [], []
+        t0 = time.perf_counter()
+        for n, (start, length) in enumerate(plan):
+            with console.status(f"[cyan]SAM on this machine[/]: segment "
+                                f"{n + 1}/{len(plan)}…", spinner="dots") as status:
+                part, usage = local_sam.track(
+                    mp4, checkpoint=cfg.SAM_LOCAL_MODEL, prompt=prompt,
+                    start_frame=start, n_frames=length,
+                    skip_frames=cfg.HOLD_TRACK_STRIDE,
+                    max_frames=cfg.HOLD_TRACK_MAX_FRAMES, half=cfg.SAM_LOCAL_HALF,
+                    progress=lambda done, total, n=n: status.update(
+                        f"[cyan]SAM on this machine[/]: segment {n + 1}/{len(plan)}, "
+                        f"frame {done} of {total}"))
+            parts.append(holds_mod.shift(part, frame_offset=start,
+                                         track_offset=n * 1000))
+            peaks.append(usage["peak_vram_mb"] or 0)
+            items, _ = holds_mod.unwrap(parts[-1])
+            console.print(f"  segment {n + 1}/{len(plan)} "
+                          f"[dim](frames {start}-{start + length - 1})[/]: "
+                          f"{len({i['track_id'] for i in items})} tracks in "
+                          f"{usage['infer_seconds']:.0f}s, peak "
+                          f"{usage['peak_vram_mb']} MB of video memory")
+        hold_seconds = time.perf_counter() - t0
+        payload = holds_mod.concat(parts)
+        hold_usage = {"backend": "local", "peak_vram_mb": max(peaks), "cost": 0.0}
+        holds_mod.save_cache(holds_cache, payload, hold_usage,
+                             stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        console.print(f"  [green]done in {hold_seconds:.1f}s[/]")
     else:
         if cfg.REUSE_HOLDS:
             console.print("  [yellow]no cached tracks for these settings[/], "
@@ -493,7 +540,7 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
                           "min_area": cfg.FLOOR_MIN_AREA,
                           "resolution": cfg.FLOOR_EDGE_RESOLUTION,
                           "canvas": camera_settings}
-        floor_cache = floor_mod.cache_path(mp4, cfg.CACHE_DIR, model=cfg.HOLD_MODEL,
+        floor_cache = floor_mod.cache_path(mp4, cfg.CACHE_DIR, model=sam_model,
                                            prompt=cfg.FLOOR_PROMPT,
                                            settings=floor_settings)
         cached_floor = floor_mod.load_cache(floor_cache) if cfg.REUSE_FLOOR else None
@@ -501,11 +548,12 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
             ground, floor_usages, created = cached_floor
             console.print(f"  floor: [green]cache hit[/] from [dim]{created}[/]")
         else:
-            client = OpenAI(base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
-                            timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
+            client = sam_local if local_sam_on else OpenAI(
+                base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
+                timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
             stills = holds_mod.sample_frames(mp4, cfg.FLOOR_SAMPLE_FRAMES)
             per_frame, floor_usages = floor_mod.segment(
-                client, stills, model=cfg.HOLD_MODEL, prompt=cfg.FLOOR_PROMPT,
+                client, stills, model=sam_model, prompt=cfg.FLOOR_PROMPT,
                 resolution=cfg.FLOOR_EDGE_RESOLUTION, min_score=cfg.FLOOR_MIN_SCORE,
                 min_area=cfg.FLOOR_MIN_AREA, workers=cfg.FLOOR_REQUEST_WORKERS,
                 console=console)
@@ -526,6 +574,9 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
             console.print(f"  [yellow]no floor found[/] for {cfg.FLOOR_PROMPT!r}; "
                           "the start rule falls back to both feet on holds")
 
+    if local_sam_on:
+        local_sam.unload()    # the pose models want the GPU next
+
     # ── 5. Pose ──────────────────────────────────────────────────────────────
     rule(7, "The climber (ViTPose)")
     video_b64, extra_body = pose.build_request(
@@ -535,14 +586,26 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
     upload_mb = len(video_b64) / 1e6
     kv({
         "model": cfg.POSE_MODEL,
+        "backend": cfg.POSE_BACKEND,
         "mode": ("every frame, detector stride 1, nothing skipped"
                  if cfg.EVERY_FRAME else f"video_fps={cfg.VIDEO_FPS} (detector cadence)"),
-        "billed units": f"~{extra_body.get('video_max_frames') or min(info.n_frames, 900)} frames",
-        "upload": f"{upload_mb:.1f} MB base64",
+        **({"runs on": "this machine; nothing is uploaded or billed"}
+           if cfg.POSE_BACKEND == "local" else {
+               "billed units": f"~{extra_body.get('video_max_frames') or min(info.n_frames, 900)} frames",
+               "upload": f"{upload_mb:.1f} MB base64"}),
     }, title="request")
 
+    local_pose_settings = {
+        "backend": "local", "detector": cfg.POSE_LOCAL_DETECTOR,
+        "det_threshold": cfg.POSE_LOCAL_DET_THRESHOLD,
+        "max_nested": cfg.POSE_LOCAL_MAX_NESTED, "half": cfg.POSE_LOCAL_HALF,
+        "track_min_iou": cfg.POSE_LOCAL_TRACK_MIN_IOU,
+        "track_max_gap": cfg.POSE_LOCAL_TRACK_MAX_GAP,
+    } if cfg.POSE_BACKEND == "local" else {}
+    # The local settings join the cache key, so a local result never answers
+    # for a gateway one and changing the detector is a miss on its own.
     poses_cache = pose.cache_path(mp4, cfg.CACHE_DIR, model=cfg.POSE_MODEL,
-                                  extra_body=extra_body)
+                                  extra_body={**extra_body, **local_pose_settings})
     cached_poses = pose.load_cache(poses_cache) if cfg.REUSE_POSES else None
 
     if cached_poses is not None:
@@ -553,6 +616,28 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
         console.print(f"  [green]cache hit[/]: poses from [dim]{created}[/] "
                       f"([dim]{poses_cache.name}[/]); no gateway call")
         console.print("  [dim]set REUSE_POSES = False in config.py to re-run detection[/]")
+    elif cfg.POSE_BACKEND == "local":
+        from src import local_pose
+        if cfg.REUSE_POSES:
+            console.print("  [yellow]no cached poses for these settings[/], running locally")
+        t0 = time.perf_counter()
+        with console.status("[cyan]ViTPose on this machine[/]…", spinner="dots") as status:
+            payload, pose_usage = local_pose.run(
+                mp4, model=cfg.POSE_MODEL, detector=cfg.POSE_LOCAL_DETECTOR,
+                extra_body=extra_body, det_threshold=cfg.POSE_LOCAL_DET_THRESHOLD,
+                max_nested=cfg.POSE_LOCAL_MAX_NESTED,
+                batch_size=cfg.POSE_LOCAL_BATCH, half=cfg.POSE_LOCAL_HALF,
+                track_min_iou=cfg.POSE_LOCAL_TRACK_MIN_IOU,
+                track_max_gap_seconds=cfg.POSE_LOCAL_TRACK_MAX_GAP,
+                progress=lambda done, total: status.update(
+                    f"[cyan]ViTPose on this machine[/]: frame {done} of {total}"))
+        elapsed = time.perf_counter() - t0
+        request_timing = timing.summarize({}, elapsed)
+        pose.save_cache(poses_cache, payload, pose_usage, asdict(request_timing),
+                        stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        console.print(f"  [green]done in {elapsed:.1f}s[/] on {pose_usage['device']}: "
+                      f"{pose_usage['fps']} frames/s, "
+                      f"peak {pose_usage['peak_vram_mb']} MB of video memory")
     else:
         if cfg.REUSE_POSES:
             console.print("  [yellow]no cached poses for these settings[/], calling the gateway")
@@ -669,10 +754,11 @@ def analyze(source: Path, *, api_key: str, run_dir: Path, batch: bool) -> Run | 
         if sites:
             console.print(f"  [dim]{len(sites)} place(s) on the wall where a limb "
                           f"rested with no hold under it; box-prompting SAM there[/]")
-            client = OpenAI(base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
-                            timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
+            client = sam_local if local_sam_on else OpenAI(
+                base_url=cfg.GATEWAY_BASE_URL, api_key=api_key,
+                timeout=cfg.REQUEST_TIMEOUT, max_retries=1)
             recovered, refused, usages = recover_mod.recover(
-                client, mp4, sites, poses, track, model=cfg.HOLD_MODEL,
+                client, mp4, sites, poses, track, model=sam_model,
                 hold_unit=hold_unit, aspect=track.size[0] / track.size[1],
                 route=route, cfg=cfg, console=console)
             recover_cost = sum(u.get("cost") or 0.0 for u in usages)
@@ -1144,9 +1230,10 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
         "ViTPose throughput": f"[bold green]{m['pose']['fps']:.1f} fps[/]  "
                               f"({m['pose']['ms_per_frame']:.0f} ms/frame, "
                               f"{m['pose']['realtime_factor']:.2f}x realtime)",
-        "SAM 3.1": f"{run.hold_seconds:.1f}s tracking the holds"
+        SAM_NAME: f"{run.hold_seconds:.1f}s tracking the holds"
                    if run.hold_seconds else "cached",
-        "gateway round trip": f"{m['gateway_round_trip']['seconds']:.2f}s",
+        ("local pose inference" if cfg.POSE_BACKEND == "local" else "gateway round trip"):
+            f"{m['gateway_round_trip']['seconds']:.2f}s",
         "render": f"{m['local']['render_seconds']:.2f}s ({m['local']['render_fps']:.1f} fps)",
         "cost": f"${total_cost:.4f}  [dim](pose ${pose_cost or 0:.4f} + "
                 f"holds ${run.hold_cost:.4f}"
@@ -1166,7 +1253,9 @@ def deliver(run: Run, comparison: compare.Comparison | None, *, step: int,
                       "fps": info.fps, "n_frames": info.n_frames},
         "tonemap": {"mode": cfg.TONEMAP, "algorithm": cfg.TONEMAP_ALGORITHM,
                     "filter": run.tonemap, "reason": run.tonemap_reason},
-        "holds": {"model": cfg.HOLD_MODEL, "prompt": run.prompt,
+        "holds": {"model": (cfg.SAM_LOCAL_MODEL if cfg.SAM_BACKEND == "local"
+                            else cfg.HOLD_MODEL),
+                  "backend": cfg.SAM_BACKEND, "prompt": run.prompt,
                   "settings": run.hold_settings, "detected": len(run.route),
                   "from_cache": run.holds_cached, "cost_usd": run.hold_cost},
         "pose": {"model": cfg.POSE_MODEL, "extra_body": run.extra_body,
@@ -1222,12 +1311,16 @@ def to_render(runs: list[Run], console) -> list[tuple[int, Run]]:
 def main() -> int:
     t_start = time.perf_counter()
     console.print()
-    console.rule("[bold]SAM 3.1 + ViTPose: rock climbing[/]", align="center")
+    console.rule(f"[bold]{SAM_NAME} + ViTPose: rock climbing[/]", align="center")
 
     # ── 1. Key ───────────────────────────────────────────────────────────────
     rule(1, "API key")
-    api_key, source = load_api_key(cfg.PROJECT_DIR)
-    console.print(f"  loaded from [green]{source}[/] ([dim]…{api_key[-4:]}[/])")
+    if cfg.SAM_BACKEND == "local" and cfg.POSE_BACKEND == "local":
+        api_key = ""
+        console.print("  not needed: SAM and ViTPose both run on this machine")
+    else:
+        api_key, source = load_api_key(cfg.PROJECT_DIR)
+        console.print(f"  loaded from [green]{source}[/] ([dim]…{api_key[-4:]}[/])")
 
     sources = discover()
     if not sources:

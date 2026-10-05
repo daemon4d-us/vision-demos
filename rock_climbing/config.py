@@ -155,7 +155,21 @@ REQUEST_TIMEOUT = 1800.0   # seconds; video pose is minutes, not seconds
 # Promptable segmentation. The prompt is the whole route definition — change
 # the colour and the demo follows a different route up the same wall.
 HOLD_MODEL = "facebook/sam3.1"
-HOLD_COLOR = "green"                        # the route being climbed
+
+# Where SAM runs: the route, the floor and the missed-hold recovery alike.
+# "gateway" sends them to the VLM Run Gateway. "local" runs SAM on this
+# machine's GPU (src/local_sam.py) and needs `pip install torch torchvision
+# transformers`, plus access to the gated checkpoint on Hugging Face. Results
+# are cached separately. With POSE_BACKEND also "local", no API key is needed.
+SAM_BACKEND = "local"
+
+# Local only. SAM 3 rather than the gateway's 3.1, which Transformers cannot
+# load. Tracking 128 sampled frames peaks near 6 GB of video memory in half
+# precision; lower HOLD_TRACK_MAX_FRAMES if a smaller card runs out.
+SAM_LOCAL_MODEL = "facebook/sam3"
+SAM_LOCAL_HALF = True             # float16 on the GPU
+SAM_LOCAL_THRESHOLD = 0.3         # stills: instances below this score are not returned
+HOLD_COLOR = "yellow"                        # the route being climbed
 
 # Per-clip override, keyed on the file's stem. A batch is normally one route
 # filmed several times, so one colour serves — but a folder of unrelated clips
@@ -278,6 +292,22 @@ FLOOR_LINE_THICK = 2
 
 # ── The climber: ViTPose ─────────────────────────────────────────────────────
 POSE_MODEL = "usyd-community/vitpose-plus-large"
+
+# Where ViTPose runs. "gateway" sends the clip to the VLM Run Gateway. "local"
+# runs the same checkpoint on this machine's GPU (src/local_pose.py) and needs
+# `pip install torch torchvision transformers`; the weights download from
+# Hugging Face on the first run. The result is cached either way, separately.
+POSE_BACKEND = "local"
+
+# Local only. ViTPose is handed boxes rather than finding people itself, so a
+# detector runs in front of it, and a box tracker supplies the `track_id`s.
+POSE_LOCAL_DETECTOR = "PekingU/rtdetr_r50vd_coco_o365"
+POSE_LOCAL_DET_THRESHOLD = 0.3    # person boxes below this score are ignored
+POSE_LOCAL_MAX_NESTED = 0.8       # a box this far inside a surer one is the same body
+POSE_LOCAL_BATCH = 8              # frames per forward pass; lower it if VRAM runs out
+POSE_LOCAL_HALF = True            # float16 on the GPU: half the memory, same joints
+POSE_LOCAL_TRACK_MIN_IOU = 0.2    # overlap needed to carry a track_id to the next frame
+POSE_LOCAL_TRACK_MAX_GAP = 1.0    # seconds unseen before a track is retired
 
 # Pose runs on every decoded frame either way; video_fps is the *detector*
 # cadence and reaches stride 1 once it is >= the decoded rate. A hand arriving

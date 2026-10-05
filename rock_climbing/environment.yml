@@ -19,3 +19,5 @@ dependencies:
   - pip
   - pip:
       - openai>=1.40
+      # Only for SAM_BACKEND / POSE_BACKEND = "local" in config.py (your own GPU):
+      #   pip install torch torchvision transformers

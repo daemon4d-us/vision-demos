@@ -37,6 +37,20 @@ The rock climbing + computer vision demo
 Both models run on the VLM Run [Gateway](https://vlm.run/gateway), whose Model
 Catalog gives you access to 22 vision models.
 
+Both models can also run on your own NVIDIA GPU instead of the Gateway, in
+which case no API key is needed:
+
+* Set `SAM_BACKEND = "local"` and `POSE_BACKEND = "local"` in
+  [`config.py`](config.py). Either can be switched on its own.
+* Run `pip install torch torchvision transformers` in the conda environment.
+* Request access to [facebook/sam3](https://huggingface.co/facebook/sam3) on
+  Hugging Face and log in with `hf auth login`. The weights download on the
+  first run.
+
+Locally the holds come from SAM 3 rather than the Gateway's SAM 3.1, so the
+route it finds can differ. Tracking needs about 6 GB of video memory, and a
+79 second clip takes about five minutes on an RTX 4060 laptop.
+
 ## Setup instructions
 
 1. Clone the [vision-demos](https://github.com/jeremyipark/vision-demos) repo.
